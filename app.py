@@ -4,7 +4,7 @@ import time
 import logging
 from flask import Flask, request, jsonify
 import requests
-import openai
+from openai import OpenAI, error as openai_error
 
 app = Flask(__name__)
 logging.basicConfig(level=logging.INFO)
@@ -14,14 +14,15 @@ WHATSAPP_TOKEN = os.environ.get("WHATSAPP_TOKEN")
 PHONE_NUMBER_ID = os.environ.get("PHONE_NUMBER_ID")
 VERIFY_TOKEN = os.environ.get("VERIFY_TOKEN", "nyaysetu_verify_token")
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
-OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-3.5-turbo")  # Default to GPT-3.5 for stability
+OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-4")
 RATE_LIMIT_SECONDS = int(os.environ.get("RATE_LIMIT_SECONDS", "3"))
 DB_PATH = os.environ.get("DB_PATH", "nyaysetu_messages.db")
 
 if not (WHATSAPP_TOKEN and PHONE_NUMBER_ID and OPENAI_API_KEY):
     app.logger.warning("Set WHATSAPP_TOKEN, PHONE_NUMBER_ID, and OPENAI_API_KEY environment variables.")
 
-openai.api_key = OPENAI_API_KEY
+# Initialize OpenAI client
+client = OpenAI(api_key=OPENAI_API_KEY)
 
 # In-memory rate limiter
 rate_limiter = {}
@@ -97,6 +98,7 @@ def webhook():
             send_text(from_number, "Sorry, I couldn't read that. Please send text.")
             return "ok", 200
 
+        # Rate limiting
         now = time.time()
         last = rate_limiter.get(from_number, 0)
         if now - last < RATE_LIMIT_SECONDS:
@@ -104,6 +106,7 @@ def webhook():
             return "rate_limited", 200
         rate_limiter[from_number] = now
 
+        # Save inbound message
         save_message(from_number, "inbound", text)
 
         system_prompt = (
@@ -125,17 +128,11 @@ def webhook():
         app.logger.exception("Webhook handler error: %s", e)
     return "ok", 200
 
-
 def ask_openai(system_prompt, user_text):
-    """
-    Send a request to OpenAI ChatCompletion.
-    Tries the preferred model first, then falls back to GPT-3.5-turbo.
-    Handles rate limit / quota errors gracefully.
-    """
     models_to_try = [OPENAI_MODEL, "gpt-3.5-turbo"]
     for model in models_to_try:
         try:
-            resp = openai.chat.completions.create(
+            resp = client.chat.completions.create(
                 model=model,
                 messages=[
                     {"role": "system", "content": system_prompt},
@@ -145,22 +142,16 @@ def ask_openai(system_prompt, user_text):
                 temperature=0.2
             )
             return resp.choices[0].message.content
-
-        except openai.error.RateLimitError as e:
-            app.logger.warning("Rate limit / quota exceeded for model %s: %s", model, e)
-            time.sleep(1)
+        except openai_error.InvalidRequestError as e:
+            app.logger.warning(f"Model {model} failed: {e}")
             continue
-
-        except openai.error.InvalidRequestError as e:
-            app.logger.warning("Model %s invalid request: %s", model, e)
-            continue
-
+        except openai_error.RateLimitError as e:
+            app.logger.warning(f"Rate limit hit: {e}")
+            return "Sorry, too many requests. Please try again later."
         except Exception as e:
-            app.logger.exception("OpenAI unexpected error: %s", e)
+            app.logger.exception("OpenAI error: %s", e)
             return "Sorry, I'm temporarily unable to answer. Please try again later."
-
-    return "Sorry, no available model could process your request at the moment."
-
+    return "Sorry, no available model could process your request."
 
 def send_text(to, text):
     url = f"https://graph.facebook.com/v17.0/{PHONE_NUMBER_ID}/messages"
@@ -175,7 +166,6 @@ def send_text(to, text):
         app.logger.exception("Error sending WhatsApp message: %s", e)
         return None
 
-
 def save_message(phone, direction, message):
     try:
         cur = db.cursor()
@@ -183,7 +173,6 @@ def save_message(phone, direction, message):
         db.commit()
     except Exception as e:
         app.logger.exception("DB save failed: %s", e)
-
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
