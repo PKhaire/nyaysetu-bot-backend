@@ -4,7 +4,7 @@ import time
 import logging
 from flask import Flask, request, jsonify
 import requests
-from openai import OpenAI
+import openai
 
 app = Flask(__name__)
 logging.basicConfig(level=logging.INFO)
@@ -14,15 +14,14 @@ WHATSAPP_TOKEN = os.environ.get("WHATSAPP_TOKEN")
 PHONE_NUMBER_ID = os.environ.get("PHONE_NUMBER_ID")
 VERIFY_TOKEN = os.environ.get("VERIFY_TOKEN", "nyaysetu_verify_token")
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
-OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-4")
+OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-4")  # Default to GPT-4
 RATE_LIMIT_SECONDS = int(os.environ.get("RATE_LIMIT_SECONDS", "3"))
 DB_PATH = os.environ.get("DB_PATH", "nyaysetu_messages.db")
 
 if not (WHATSAPP_TOKEN and PHONE_NUMBER_ID and OPENAI_API_KEY):
     app.logger.warning("Set WHATSAPP_TOKEN, PHONE_NUMBER_ID, and OPENAI_API_KEY environment variables.")
 
-# Initialize OpenAI client
-client = OpenAI(api_key=OPENAI_API_KEY)
+openai.api_key = OPENAI_API_KEY
 
 # In-memory rate limiter
 rate_limiter = {}
@@ -47,7 +46,7 @@ def init_db():
 
 init_db()
 
-# ✅ Root route for Render health check
+# Root route for health check
 @app.route("/", methods=["GET"])
 def home():
     return jsonify({
@@ -94,7 +93,7 @@ def webhook():
 
         app.logger.info("Message from %s: %s", from_number, text)
 
-        if not text or text.strip() == "":
+        if not text.strip():
             send_text(from_number, "Sorry, I couldn't read that. Please send text.")
             return "ok", 200
 
@@ -127,22 +126,27 @@ def webhook():
     return "ok", 200
 
 def ask_openai(system_prompt, user_text):
-    try:
-        response = client.chat.completions.create(
-            model=OPENAI_MODEL,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_text}
-            ],
-            max_tokens=500,
-            temperature=0.2
-        )
-        answer = response.choices[0].message.content
-        app.logger.info("OpenAI response: %s", answer)
-        return answer
-    except Exception as e:
-        app.logger.exception("OpenAI error: %s", e)
-        return "Sorry, I'm temporarily unable to answer. Please try again later."
+    # Try GPT-4 first, fallback to GPT-3.5
+    models_to_try = [OPENAI_MODEL, "gpt-3.5-turbo"]
+    for model in models_to_try:
+        try:
+            resp = openai.ChatCompletion.create(
+                model=model,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_text}
+                ],
+                max_tokens=500,
+                temperature=0.2
+            )
+            return resp["choices"][0]["message"]["content"]
+        except openai.error.InvalidRequestError as e:
+            app.logger.warning(f"Model {model} failed: {e}")
+            continue
+        except Exception as e:
+            app.logger.exception("OpenAI error: %s", e)
+            return "Sorry, I'm temporarily unable to answer. Please try again later."
+    return "Sorry, no available model could process your request."
 
 def send_text(to, text):
     url = f"https://graph.facebook.com/v17.0/{PHONE_NUMBER_ID}/messages"
