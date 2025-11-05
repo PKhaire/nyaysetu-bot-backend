@@ -4,7 +4,8 @@ import time
 import logging
 from flask import Flask, request, jsonify
 import requests
-from openai import OpenAI, error as openai_error
+from openai import OpenAI
+import openai.error as openai_error  # Fixed import for exceptions
 
 app = Flask(__name__)
 logging.basicConfig(level=logging.INFO)
@@ -148,8 +149,11 @@ def ask_openai(system_prompt, user_text):
         except openai_error.RateLimitError as e:
             app.logger.warning(f"Rate limit hit: {e}")
             return "Sorry, too many requests. Please try again later."
+        except openai_error.APIError as e:
+            app.logger.warning(f"OpenAI API error: {e}")
+            return "Sorry, I'm temporarily unable to answer. Please try again later."
         except Exception as e:
-            app.logger.exception("OpenAI error: %s", e)
+            app.logger.exception("Unexpected OpenAI error: %s", e)
             return "Sorry, I'm temporarily unable to answer. Please try again later."
     return "Sorry, no available model could process your request."
 
