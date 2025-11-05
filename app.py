@@ -4,7 +4,7 @@ import time
 import logging
 from flask import Flask, request, jsonify
 import requests
-import openai
+from openai import OpenAI
 
 app = Flask(__name__)
 logging.basicConfig(level=logging.INFO)
@@ -21,7 +21,8 @@ DB_PATH = os.environ.get("DB_PATH", "nyaysetu_messages.db")
 if not (WHATSAPP_TOKEN and PHONE_NUMBER_ID and OPENAI_API_KEY):
     app.logger.warning("Set WHATSAPP_TOKEN, PHONE_NUMBER_ID, and OPENAI_API_KEY environment variables.")
 
-openai.api_key = OPENAI_API_KEY
+# Initialize OpenAI client
+client = OpenAI(api_key=OPENAI_API_KEY)
 
 # In-memory rate limiter
 rate_limiter = {}
@@ -97,6 +98,7 @@ def webhook():
             send_text(from_number, "Sorry, I couldn't read that. Please send text.")
             return "ok", 200
 
+        # Rate limiting
         now = time.time()
         last = rate_limiter.get(from_number, 0)
         if now - last < RATE_LIMIT_SECONDS:
@@ -126,11 +128,14 @@ def webhook():
     return "ok", 200
 
 def ask_openai(system_prompt, user_text):
-    # Try GPT-4 first, fallback to GPT-3.5
+    """
+    Ask OpenAI using the new API (v1+).
+    Tries GPT-4 first, falls back to GPT-3.5 if unavailable.
+    """
     models_to_try = [OPENAI_MODEL, "gpt-3.5-turbo"]
     for model in models_to_try:
         try:
-            resp = openai.ChatCompletion.create(
+            resp = client.chat.completions.create(
                 model=model,
                 messages=[
                     {"role": "system", "content": system_prompt},
@@ -139,13 +144,10 @@ def ask_openai(system_prompt, user_text):
                 max_tokens=500,
                 temperature=0.2
             )
-            return resp["choices"][0]["message"]["content"]
-        except openai.error.InvalidRequestError as e:
-            app.logger.warning(f"Model {model} failed: {e}")
-            continue
+            return resp.choices[0].message.content
         except Exception as e:
-            app.logger.exception("OpenAI error: %s", e)
-            return "Sorry, I'm temporarily unable to answer. Please try again later."
+            app.logger.exception("OpenAI error with model %s: %s", model, e)
+            continue
     return "Sorry, no available model could process your request."
 
 def send_text(to, text):
