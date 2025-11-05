@@ -1,10 +1,12 @@
+# app.py (modified)
 import os
 import sqlite3
 import time
 import logging
 from flask import Flask, request, jsonify
 import requests
-import openai
+# from openai import OpenAI  <-- (we'll import below after reading config)
+from openai import OpenAI
 
 app = Flask(__name__)
 logging.basicConfig(level=logging.INFO)
@@ -21,7 +23,17 @@ DB_PATH = os.environ.get("DB_PATH", "nyaysetu_messages.db")
 if not (WHATSAPP_TOKEN and PHONE_NUMBER_ID and OPENAI_API_KEY):
     app.logger.warning("Set WHATSAPP_TOKEN, PHONE_NUMBER_ID, and OPENAI_API_KEY environment variables.")
 
-openai.api_key = OPENAI_API_KEY
+# Initialize OpenAI client using the new SDK (v1.x+)
+# If OPENAI_API_KEY is present, pass it explicitly; otherwise OpenAI() will try to read from env.
+try:
+    if OPENAI_API_KEY:
+        openai_client = OpenAI(api_key=OPENAI_API_KEY)
+    else:
+        openai_client = OpenAI()
+    app.logger.info("OpenAI client initialized (model=%s)", OPENAI_MODEL)
+except Exception as e:
+    openai_client = None
+    app.logger.exception("Failed to initialize OpenAI client: %s", e)
 
 # In-memory rate limiter
 rate_limiter = {}
@@ -99,7 +111,7 @@ def webhook():
 
         ai_reply = ask_openai(system_prompt, text)
 
-        disclaimer = "\\n\\nNote: This is general information and not a substitute for legal advice."
+        disclaimer = "\n\nNote: This is general information and not a substitute for legal advice."
         final_reply = ai_reply.strip() + disclaimer
 
         save_message(from_number, "outbound", final_reply)
@@ -111,14 +123,31 @@ def webhook():
     return "ok", 200
 
 def ask_openai(system_prompt, user_text):
+    """
+    Updated to use the new OpenAI client API:
+      resp = openai_client.chat.completions.create(...)
+      -> access the reply at resp.choices[0].message.content
+    """
+    if openai_client is None:
+        app.logger.error("OpenAI client not initialized.")
+        return "Sorry, I'm temporarily unable to answer. Please try again later."
+
     try:
-        resp = openai.ChatCompletion.create(
+        resp = openai_client.chat.completions.create(
             model=OPENAI_MODEL,
-            messages=[{"role":"system","content":system_prompt},{"role":"user","content":user_text}],
+            messages=[
+                {"role":"system","content":system_prompt},
+                {"role":"user","content":user_text}
+            ],
             max_tokens=500,
             temperature=0.2
         )
-        return resp["choices"][0]["message"]["content"]
+        # defensive check
+        if not getattr(resp, "choices", None) or len(resp.choices) == 0:
+            app.logger.error("OpenAI returned no choices: %s", resp)
+            return "Sorry, I couldn't generate an answer. Please try again."
+        # New SDK returns objects with attributes
+        return resp.choices[0].message.content
     except Exception as e:
         app.logger.exception("OpenAI error: %s", e)
         return "Sorry, I'm temporarily unable to answer. Please try again later."
