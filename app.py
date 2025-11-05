@@ -4,7 +4,7 @@ import time
 import logging
 from flask import Flask, request, jsonify
 import requests
-import openai
+from openai import OpenAI
 
 app = Flask(__name__)
 logging.basicConfig(level=logging.INFO)
@@ -21,7 +21,8 @@ DB_PATH = os.environ.get("DB_PATH", "nyaysetu_messages.db")
 if not (WHATSAPP_TOKEN and PHONE_NUMBER_ID and OPENAI_API_KEY):
     app.logger.warning("Set WHATSAPP_TOKEN, PHONE_NUMBER_ID, and OPENAI_API_KEY environment variables.")
 
-openai.api_key = OPENAI_API_KEY
+# Initialize OpenAI client
+client = OpenAI(api_key=OPENAI_API_KEY)
 
 # In-memory rate limiter
 rate_limiter = {}
@@ -107,8 +108,10 @@ def webhook():
         save_message(from_number, "inbound", text)
 
         system_prompt = (
-            "You are NyaySetu, an India-aware legal information assistant. Provide concise, practical, and informational responses. "
-            "Keep answers short (<=200 words), include next steps and official portals if available. Always include a short disclaimer."
+            "You are NyaySetu, an India-aware legal information assistant. "
+            "Provide concise, practical, and informational responses. "
+            "Keep answers short (<=200 words), include next steps and official portals if available. "
+            "Always include a short disclaimer."
         )
 
         ai_reply = ask_openai(system_prompt, text)
@@ -125,14 +128,18 @@ def webhook():
 
 def ask_openai(system_prompt, user_text):
     try:
-        resp = openai.ChatCompletion.create(
+        response = client.chat.completions.create(
             model=OPENAI_MODEL,
-            messages=[{"role": "system", "content": system_prompt},
-                      {"role": "user", "content": user_text}],
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_text}
+            ],
             max_tokens=500,
             temperature=0.2
         )
-        return resp["choices"][0]["message"]["content"]
+        answer = response.choices[0].message.content
+        app.logger.info("OpenAI response: %s", answer)
+        return answer
     except Exception as e:
         app.logger.exception("OpenAI error: %s", e)
         return "Sorry, I'm temporarily unable to answer. Please try again later."
