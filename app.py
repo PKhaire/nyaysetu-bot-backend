@@ -2,15 +2,14 @@ import os
 import sqlite3
 import time
 import logging
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, g
 import requests
 from openai import OpenAI
-import openai.error as openai_error  # Fixed import for exceptions
 
 app = Flask(__name__)
 logging.basicConfig(level=logging.INFO)
 
-# Configuration (environment variables)
+# Config
 WHATSAPP_TOKEN = os.environ.get("WHATSAPP_TOKEN")
 PHONE_NUMBER_ID = os.environ.get("PHONE_NUMBER_ID")
 VERIFY_TOKEN = os.environ.get("VERIFY_TOKEN", "nyaysetu_verify_token")
@@ -22,21 +21,27 @@ DB_PATH = os.environ.get("DB_PATH", "nyaysetu_messages.db")
 if not (WHATSAPP_TOKEN and PHONE_NUMBER_ID and OPENAI_API_KEY):
     app.logger.warning("Set WHATSAPP_TOKEN, PHONE_NUMBER_ID, and OPENAI_API_KEY environment variables.")
 
-# Initialize OpenAI client
+# OpenAI client
 client = OpenAI(api_key=OPENAI_API_KEY)
 
-# In-memory rate limiter
+# Rate limiter
 rate_limiter = {}
 
-# DB helpers
+# ----------------- DATABASE -----------------
 def get_db():
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-    conn.row_factory = sqlite3.Row
-    return conn
+    if "db" not in g:
+        g.db = sqlite3.connect(DB_PATH)
+        g.db.row_factory = sqlite3.Row
+    return g.db
 
-db = get_db()
+@app.teardown_appcontext
+def close_db(exception):
+    db = g.pop("db", None)
+    if db is not None:
+        db.close()
 
 def init_db():
+    db = sqlite3.connect(DB_PATH)
     cur = db.cursor()
     cur.execute(
         "CREATE TABLE IF NOT EXISTS chats ("
@@ -45,21 +50,30 @@ def init_db():
         "timestamp DATETIME DEFAULT CURRENT_TIMESTAMP)"
     )
     db.commit()
+    db.close()
 
 init_db()
 
-# Root route for health check
+def save_message(phone, direction, message):
+    try:
+        db = get_db()
+        cur = db.cursor()
+        cur.execute(
+            "INSERT INTO chats (phone, direction, message) VALUES (?, ?, ?)",
+            (phone, direction, message)
+        )
+        db.commit()
+    except Exception as e:
+        app.logger.exception("DB save failed: %s", e)
+
+# ----------------- ROUTES -----------------
 @app.route("/", methods=["GET"])
 def home():
-    return jsonify({
-        "message": "✅ NyaySetu API is live and healthy!",
-        "status": "ok",
-        "timestamp": int(time.time())
-    }), 200
+    return jsonify({"message": "✅ NyaySetu API live!", "status": "ok", "timestamp": int(time.time())})
 
 @app.route("/health", methods=["GET"])
 def health():
-    return jsonify({"status": "ok", "ts": int(time.time())}), 200
+    return jsonify({"status": "ok", "ts": int(time.time())})
 
 @app.route("/webhook", methods=["GET"])
 def verify():
@@ -67,7 +81,6 @@ def verify():
     token = request.args.get("hub.verify_token")
     challenge = request.args.get("hub.challenge")
     if mode == "subscribe" and token == VERIFY_TOKEN:
-        app.logger.info("Webhook verified")
         return challenge, 200
     return "Forbidden", 403
 
@@ -90,10 +103,6 @@ def webhook():
             text = message["text"].get("body", "")
         elif "button" in message:
             text = message["button"].get("text", "")
-        else:
-            text = ""
-
-        app.logger.info("Message from %s: %s", from_number, text)
 
         if not text.strip():
             send_text(from_number, "Sorry, I couldn't read that. Please send text.")
@@ -103,11 +112,9 @@ def webhook():
         now = time.time()
         last = rate_limiter.get(from_number, 0)
         if now - last < RATE_LIMIT_SECONDS:
-            app.logger.info("Rate limited user %s", from_number)
             return "rate_limited", 200
         rate_limiter[from_number] = now
 
-        # Save inbound message
         save_message(from_number, "inbound", text)
 
         system_prompt = (
@@ -118,7 +125,6 @@ def webhook():
         )
 
         ai_reply = ask_openai(system_prompt, text)
-
         disclaimer = "\n\nNote: This is general information and not a substitute for legal advice."
         final_reply = ai_reply.strip() + disclaimer
 
@@ -129,6 +135,7 @@ def webhook():
         app.logger.exception("Webhook handler error: %s", e)
     return "ok", 200
 
+# ----------------- OPENAI -----------------
 def ask_openai(system_prompt, user_text):
     models_to_try = [OPENAI_MODEL, "gpt-3.5-turbo"]
     for model in models_to_try:
@@ -143,20 +150,12 @@ def ask_openai(system_prompt, user_text):
                 temperature=0.2
             )
             return resp.choices[0].message.content
-        except openai_error.InvalidRequestError as e:
+        except Exception as e:
             app.logger.warning(f"Model {model} failed: {e}")
             continue
-        except openai_error.RateLimitError as e:
-            app.logger.warning(f"Rate limit hit: {e}")
-            return "Sorry, too many requests. Please try again later."
-        except openai_error.APIError as e:
-            app.logger.warning(f"OpenAI API error: {e}")
-            return "Sorry, I'm temporarily unable to answer. Please try again later."
-        except Exception as e:
-            app.logger.exception("Unexpected OpenAI error: %s", e)
-            return "Sorry, I'm temporarily unable to answer. Please try again later."
     return "Sorry, no available model could process your request."
 
+# ----------------- WHATSAPP -----------------
 def send_text(to, text):
     url = f"https://graph.facebook.com/v17.0/{PHONE_NUMBER_ID}/messages"
     headers = {"Authorization": f"Bearer {WHATSAPP_TOKEN}", "Content-Type": "application/json"}
@@ -170,13 +169,6 @@ def send_text(to, text):
         app.logger.exception("Error sending WhatsApp message: %s", e)
         return None
 
-def save_message(phone, direction, message):
-    try:
-        cur = db.cursor()
-        cur.execute("INSERT INTO chats (phone, direction, message) VALUES (?, ?, ?)", (phone, direction, message))
-        db.commit()
-    except Exception as e:
-        app.logger.exception("DB save failed: %s", e)
-
+# ----------------- MAIN -----------------
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
