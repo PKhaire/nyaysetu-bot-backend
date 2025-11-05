@@ -1,12 +1,10 @@
-# app.py (modified)
 import os
 import sqlite3
 import time
 import logging
 from flask import Flask, request, jsonify
 import requests
-# from openai import OpenAI  <-- (we'll import below after reading config)
-from openai import OpenAI
+import openai
 
 app = Flask(__name__)
 logging.basicConfig(level=logging.INFO)
@@ -23,17 +21,7 @@ DB_PATH = os.environ.get("DB_PATH", "nyaysetu_messages.db")
 if not (WHATSAPP_TOKEN and PHONE_NUMBER_ID and OPENAI_API_KEY):
     app.logger.warning("Set WHATSAPP_TOKEN, PHONE_NUMBER_ID, and OPENAI_API_KEY environment variables.")
 
-# Initialize OpenAI client using the new SDK (v1.x+)
-# If OPENAI_API_KEY is present, pass it explicitly; otherwise OpenAI() will try to read from env.
-try:
-    if OPENAI_API_KEY:
-        openai_client = OpenAI(api_key=OPENAI_API_KEY)
-    else:
-        openai_client = OpenAI()
-    app.logger.info("OpenAI client initialized (model=%s)", OPENAI_MODEL)
-except Exception as e:
-    openai_client = None
-    app.logger.exception("Failed to initialize OpenAI client: %s", e)
+openai.api_key = OPENAI_API_KEY
 
 # In-memory rate limiter
 rate_limiter = {}
@@ -48,14 +36,28 @@ db = get_db()
 
 def init_db():
     cur = db.cursor()
-    cur.execute("CREATE TABLE IF NOT EXISTS chats (id INTEGER PRIMARY KEY AUTOINCREMENT, phone TEXT, direction TEXT, message TEXT, timestamp DATETIME DEFAULT CURRENT_TIMESTAMP)")
+    cur.execute(
+        "CREATE TABLE IF NOT EXISTS chats ("
+        "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+        "phone TEXT, direction TEXT, message TEXT, "
+        "timestamp DATETIME DEFAULT CURRENT_TIMESTAMP)"
+    )
     db.commit()
 
 init_db()
 
+# ✅ Root route for Render health check
+@app.route("/", methods=["GET"])
+def home():
+    return jsonify({
+        "message": "✅ NyaySetu API is live and healthy!",
+        "status": "ok",
+        "timestamp": int(time.time())
+    }), 200
+
 @app.route("/health", methods=["GET"])
 def health():
-    return jsonify({"status":"ok","ts":int(time.time())}), 200
+    return jsonify({"status": "ok", "ts": int(time.time())}), 200
 
 @app.route("/webhook", methods=["GET"])
 def verify():
@@ -115,7 +117,6 @@ def webhook():
         final_reply = ai_reply.strip() + disclaimer
 
         save_message(from_number, "outbound", final_reply)
-
         send_text(from_number, final_reply)
 
     except Exception as e:
@@ -123,31 +124,15 @@ def webhook():
     return "ok", 200
 
 def ask_openai(system_prompt, user_text):
-    """
-    Updated to use the new OpenAI client API:
-      resp = openai_client.chat.completions.create(...)
-      -> access the reply at resp.choices[0].message.content
-    """
-    if openai_client is None:
-        app.logger.error("OpenAI client not initialized.")
-        return "Sorry, I'm temporarily unable to answer. Please try again later."
-
     try:
-        resp = openai_client.chat.completions.create(
+        resp = openai.ChatCompletion.create(
             model=OPENAI_MODEL,
-            messages=[
-                {"role":"system","content":system_prompt},
-                {"role":"user","content":user_text}
-            ],
+            messages=[{"role": "system", "content": system_prompt},
+                      {"role": "user", "content": user_text}],
             max_tokens=500,
             temperature=0.2
         )
-        # defensive check
-        if not getattr(resp, "choices", None) or len(resp.choices) == 0:
-            app.logger.error("OpenAI returned no choices: %s", resp)
-            return "Sorry, I couldn't generate an answer. Please try again."
-        # New SDK returns objects with attributes
-        return resp.choices[0].message.content
+        return resp["choices"][0]["message"]["content"]
     except Exception as e:
         app.logger.exception("OpenAI error: %s", e)
         return "Sorry, I'm temporarily unable to answer. Please try again later."
@@ -155,7 +140,7 @@ def ask_openai(system_prompt, user_text):
 def send_text(to, text):
     url = f"https://graph.facebook.com/v17.0/{PHONE_NUMBER_ID}/messages"
     headers = {"Authorization": f"Bearer {WHATSAPP_TOKEN}", "Content-Type": "application/json"}
-    payload = {"messaging_product":"whatsapp","to":to,"type":"text","text":{"body": text}}
+    payload = {"messaging_product": "whatsapp", "to": to, "type": "text", "text": {"body": text}}
     try:
         r = requests.post(url, json=payload, headers=headers, timeout=15)
         if r.status_code >= 400:
