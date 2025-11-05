@@ -2,29 +2,27 @@ import os
 import time
 import logging
 from flask import Flask, request, jsonify
-import openai
-from openai import OpenAI
-from requests.exceptions import HTTPError
+from openai import OpenAI, RateLimitError, InvalidRequestError, APIError
 
 app = Flask(__name__)
-
-# Logging setup
 logging.basicConfig(level=logging.INFO)
 
-# OpenAI API Key & model
-openai.api_key = os.environ.get("OPENAI_API_KEY")
-OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-3.5-turbo")
+# OpenAI client
+openai_api_key = os.environ.get("OPENAI_API_KEY")
+client = OpenAI(api_key=openai_api_key)
 
-client = OpenAI(api_key=openai.api_key)
+# Default and fallback models
+PRIMARY_MODEL = os.environ.get("OPENAI_MODEL", "gpt-4")
+FALLBACK_MODELS = ["gpt-3.5-turbo"]
 
-# WhatsApp webhook verification
+# WhatsApp verification token
 VERIFY_TOKEN = os.environ.get("WHATSAPP_VERIFY_TOKEN", "your_verify_token")
 
 
 @app.route("/webhook", methods=["GET", "POST"])
 def webhook():
     if request.method == "GET":
-        # Verification handshake with WhatsApp
+        # Verification handshake
         mode = request.args.get("hub.mode")
         token = request.args.get("hub.verify_token")
         challenge = request.args.get("hub.challenge")
@@ -37,10 +35,7 @@ def webhook():
         app.logger.info(f"Payload received: {payload}")
 
         try:
-            entry = payload.get("entry", [])[0]
-            changes = entry.get("changes", [])[0]
-            value = changes.get("value", {})
-            messages = value.get("messages", [])
+            messages = payload["entry"][0]["changes"][0]["value"].get("messages", [])
             if not messages:
                 return jsonify({"status": "no messages"}), 200
 
@@ -48,28 +43,27 @@ def webhook():
             user_text = msg.get("text", {}).get("body", "")
             sender_id = msg.get("from")
 
-            # Generate reply using OpenAI
             reply_text = generate_reply("You are a helpful assistant.", user_text)
-
-            # TODO: Send reply back via WhatsApp API
             app.logger.info(f"Reply to {sender_id}: {reply_text}")
 
         except Exception as e:
             app.logger.error(f"Error processing webhook: {e}")
+            return jsonify({"status": "error"}), 500
 
         return jsonify({"status": "success"}), 200
 
 
 def generate_reply(system_prompt, user_text):
     """
-    Generate a reply from OpenAI with model fallback and rate-limit retry.
+    Generates a reply using OpenAI, automatically falling back to alternate models if needed.
     """
-    models_to_try = [OPENAI_MODEL, "gpt-3.5-turbo"]
+    models_to_try = [PRIMARY_MODEL] + FALLBACK_MODELS
     max_retries = 5
+
     for model in models_to_try:
         for attempt in range(max_retries):
             try:
-                resp = client.chat.completions.create(
+                response = client.chat.completions.create(
                     model=model,
                     messages=[
                         {"role": "system", "content": system_prompt},
@@ -78,21 +72,30 @@ def generate_reply(system_prompt, user_text):
                     max_tokens=500,
                     temperature=0.2
                 )
-                return resp.choices[0].message.content
+                return response.choices[0].message.content
 
-            except openai.error.RateLimitError as e:
-                # Exponential backoff
-                wait_time = (2 ** attempt) + (0.1 * attempt)
+            except RateLimitError:
+                # Retry with exponential backoff
+                wait_time = (2 ** attempt) + 0.1 * attempt
                 app.logger.warning(f"Rate limit hit for model {model}. Retrying in {wait_time:.2f}s (attempt {attempt+1})")
                 time.sleep(wait_time)
-            except openai.error.InvalidRequestError as e:
-                app.logger.warning(f"Model {model} invalid or unavailable: {e}")
-                break  # No point retrying an invalid model
-            except Exception as e:
-                app.logger.error(f"Unexpected OpenAI error with model {model}: {e}")
-                break  # Other errors shouldn't be retried
 
-    # Fallback message if all models fail
+            except InvalidRequestError as e:
+                # Model not found or unavailable, skip to next model
+                app.logger.warning(f"Model {model} invalid or unavailable: {e}")
+                break
+
+            except APIError as e:
+                # Temporary API error, retry
+                wait_time = (2 ** attempt) + 0.1 * attempt
+                app.logger.warning(f"OpenAI API error: {e}. Retrying in {wait_time:.2f}s (attempt {attempt+1})")
+                time.sleep(wait_time)
+
+            except Exception as e:
+                app.logger.error(f"Unexpected error with model {model}: {e}")
+                break
+
+    # If all models fail
     return "Sorry, I'm temporarily unable to process requests. Please try again later."
 
 
