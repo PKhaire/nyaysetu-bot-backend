@@ -11,9 +11,9 @@ logging.basicConfig(level=logging.INFO)
 openai_api_key = os.environ.get("OPENAI_API_KEY")
 client = OpenAI(api_key=openai_api_key)
 
-# Default and fallback models
-PRIMARY_MODEL = os.environ.get("OPENAI_MODEL", "gpt-4")
-FALLBACK_MODELS = ["gpt-3.5-turbo"]
+# Default and fallback models (updated for OpenAI SDK v1.43.0)
+PRIMARY_MODEL = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
+FALLBACK_MODELS = ["gpt-4o", "gpt-3.5-turbo"]
 
 # WhatsApp verification token
 VERIFY_TOKEN = os.environ.get("WHATSAPP_VERIFY_TOKEN", "your_verify_token")
@@ -83,8 +83,11 @@ def generate_reply(system_prompt, user_text):
                 time.sleep(wait_time)
 
             except BadRequestError as e:
-                # Model not found or unavailable, skip to next model
-                app.logger.warning(f"Model {model} invalid or unavailable: {e}")
+                # Handle invalid or missing model gracefully
+                if "model_not_found" in str(e):
+                    app.logger.warning(f"Model {model} not found. Trying next model.")
+                else:
+                    app.logger.warning(f"Bad request with model {model}: {e}")
                 break
 
             except APIError as e:
