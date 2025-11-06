@@ -2,7 +2,7 @@ import os
 import time
 import logging
 from flask import Flask, request, jsonify
-from openai import OpenAI, RateLimitError, InvalidRequestError, APIError
+from openai import OpenAI, RateLimitError, BadRequestError, APIError
 
 app = Flask(__name__)
 logging.basicConfig(level=logging.INFO)
@@ -77,10 +77,12 @@ def generate_reply(system_prompt, user_text):
             except RateLimitError:
                 # Retry with exponential backoff
                 wait_time = (2 ** attempt) + 0.1 * attempt
-                app.logger.warning(f"Rate limit hit for model {model}. Retrying in {wait_time:.2f}s (attempt {attempt+1})")
+                app.logger.warning(
+                    f"Rate limit hit for model {model}. Retrying in {wait_time:.2f}s (attempt {attempt+1})"
+                )
                 time.sleep(wait_time)
 
-            except InvalidRequestError as e:
+            except BadRequestError as e:
                 # Model not found or unavailable, skip to next model
                 app.logger.warning(f"Model {model} invalid or unavailable: {e}")
                 break
@@ -88,7 +90,9 @@ def generate_reply(system_prompt, user_text):
             except APIError as e:
                 # Temporary API error, retry
                 wait_time = (2 ** attempt) + 0.1 * attempt
-                app.logger.warning(f"OpenAI API error: {e}. Retrying in {wait_time:.2f}s (attempt {attempt+1})")
+                app.logger.warning(
+                    f"OpenAI API error: {e}. Retrying in {wait_time:.2f}s (attempt {attempt+1})"
+                )
                 time.sleep(wait_time)
 
             except Exception as e:
