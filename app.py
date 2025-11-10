@@ -64,7 +64,7 @@ def webhook():
 
 
 def send_whatsapp_message(to, text):
-    url = f"https://graph.facebook.com/v16.0/{WHATSAPP_PHONE_ID}/messages"
+    url = f"https://graph.facebook.com/v24.0/{WHATSAPP_PHONE_ID}/messages"
     headers = {
         "Authorization": f"Bearer {WHATSAPP_ACCESS_TOKEN}",
         "Content-Type": "application/json"
