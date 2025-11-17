@@ -1,70 +1,121 @@
 import os
+import time
 import logging
 import requests
 from flask import Flask, request, jsonify
+from openai import OpenAI, RateLimitError, BadRequestError, APIError
 
-# Initialize Flask app
+# Flask app setup
 app = Flask(__name__)
-
-# Setup logging to see info and errors in your console/logs
 logging.basicConfig(level=logging.INFO)
 
-# Environment variables for configuration (make sure these are set exactly in your environment)
-VERIFY_TOKEN = os.environ.get("WHATSAPP_VERIFY_TOKEN", "your_verify_token")  # webhook verification token
-WHATSAPP_PHONE_ID = os.environ.get("WHATSAPP_PHONE_ID", "")                 # WhatsApp Business phone number ID
-WHATSAPP_ACCESS_TOKEN = os.environ.get("WHATSAPP_ACCESS_TOKEN", "")         # WhatsApp Cloud API access token
+# OpenAI client
+openai_api_key = os.environ.get("OPENAI_API_KEY")
+client = OpenAI(api_key=openai_api_key)
+
+# Default and fallback models
+PRIMARY_MODEL = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
+FALLBACK_MODELS = ["gpt-4o", "gpt-3.5-turbo"]
+
+# WhatsApp verification token & phone number ID
+VERIFY_TOKEN = os.environ.get("WHATSAPP_VERIFY_TOKEN", "your_verify_token")
+WHATSAPP_PHONE_ID = os.environ.get("WHATSAPP_PHONE_ID", "")
+WHATSAPP_ACCESS_TOKEN = os.environ.get("WHATSAPP_ACCESS_TOKEN", "")
 
 
 @app.route("/webhook", methods=["GET", "POST"])
 def webhook():
+    # --------------------- VERIFICATION (GET) ------------------------
     if request.method == "GET":
-        # Facebook webhook verification step
         mode = request.args.get("hub.mode")
         token = request.args.get("hub.verify_token")
         challenge = request.args.get("hub.challenge")
 
         if mode == "subscribe" and token == VERIFY_TOKEN:
-            app.logger.info("Webhook verified successfully")
             return challenge, 200
-        else:
-            app.logger.warning("Webhook verification failed: token mismatch")
-            return "Verification token mismatch", 403
 
+        return "Verification token mismatch", 403
+
+    # ----------------------- PROCESS MESSAGE (POST) ------------------
     if request.method == "POST":
-        # Handle incoming WhatsApp messages here
-        data = request.get_json()
-        app.logger.info(f"Received webhook data: {data}")
+        payload = request.get_json() or {}
+        app.logger.info(f"Payload received: {payload}")
 
         try:
-            # Extract the message details from the payload
-            changes = data.get("entry", [])[0].get("changes", [])
-            if not changes:
-                app.logger.info("No changes found in webhook payload")
-                return jsonify({"status": "no changes"}), 200
+            # Safe extraction
+            entry = payload.get("entry", [])
+            if not entry:
+                return jsonify({"status": "empty entry"}), 200
 
-            messages = changes[0]["value"].get("messages", [])
+            changes = entry[0].get("changes", [])
+            if not changes:
+                return jsonify({"status": "empty changes"}), 200
+
+            value = changes[0].get("value", {})
+            messages = value.get("messages", [])
             if not messages:
-                app.logger.info("No messages found in webhook payload")
                 return jsonify({"status": "no messages"}), 200
 
-            message = messages[0]
-            sender_id = message.get("from")
-            user_text = message.get("text", {}).get("body", "")
+            msg = messages[0]
+            sender_id = msg.get("from", "")
+            user_text = msg.get("text", {}).get("body", "")
 
-            app.logger.info(f"Message from {sender_id}: {user_text}")
+            if not sender_id or not user_text:
+                return jsonify({"status": "invalid message"}), 200
 
-            # Send a simple reply back
-            send_whatsapp_message(sender_id, "Hi! Your message was received.")
+            app.logger.info(f"Received message from {sender_id}: {user_text}")
+
+            reply_text = generate_reply("You are a helpful assistant.", user_text)
+
+            send_whatsapp_message(sender_id, reply_text)
 
         except Exception as e:
-            app.logger.error(f"Error in webhook POST: {e}")
+            app.logger.error(f"Error processing webhook: {e}")
             return jsonify({"status": "error"}), 500
 
         return jsonify({"status": "success"}), 200
 
 
+def generate_reply(system_prompt, user_text):
+    models_to_try = [PRIMARY_MODEL] + FALLBACK_MODELS
+    max_retries = 5
+
+    for model in models_to_try:
+        for attempt in range(max_retries):
+            try:
+                response = client.chat.completions.create(
+                    model=model,
+                    messages=[
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": user_text}
+                    ],
+                    max_tokens=500,
+                    temperature=0.2
+                )
+                return response.choices[0].message.content
+
+            except RateLimitError:
+                wait_time = (2 ** attempt) + 0.1 * attempt
+                time.sleep(wait_time)
+
+            except BadRequestError as e:
+                if "model_not_found" in str(e):
+                    break
+                else:
+                    break
+
+            except APIError:
+                wait_time = (2 ** attempt) + 0.1 * attempt
+                time.sleep(wait_time)
+
+            except Exception:
+                break
+
+    return "Sorry, I'm temporarily unable to process that."
+
+
 def send_whatsapp_message(to, text):
-    url = f"https://graph.facebook.com/v24.0/{WHATSAPP_PHONE_ID}/messages"
+    url = f"https://graph.facebook.com/v19.0/{WHATSAPP_PHONE_ID}/messages"
     headers = {
         "Authorization": f"Bearer {WHATSAPP_ACCESS_TOKEN}",
         "Content-Type": "application/json"
@@ -77,12 +128,11 @@ def send_whatsapp_message(to, text):
     }
 
     try:
-        resp = requests.post(url, headers=headers, json=data)
-        app.logger.info(f"WhatsApp API response status: {resp.status_code}, body: {resp.text}")
-        resp.raise_for_status()
-        app.logger.info(f"Sent message to {to}: {text}")
+        response = requests.post(url, headers=headers, json=data)
+        response.raise_for_status()
+        app.logger.info(f"Sent message to {to}")
     except requests.exceptions.RequestException as e:
-        app.logger.error(f"Failed to send message: {e}")
+        app.logger.error(f"Failed to send message to {to}: {e}")
 
 
 if __name__ == "__main__":
